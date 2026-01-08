@@ -25,23 +25,25 @@ const defaultWords = [
     "blowjob", "six seven", "seis sete"
 ];
 
-const stmt = db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)');
-defaultWords.forEach(w => stmt.run(w.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')));
+// Função para limpar e inserir palavras
+const insertStmt = db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)');
+defaultWords.forEach(w => insertStmt.run(w.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')));
 
-let badWordsCache = new Set();
+let badWordsRegex = null;
+
 function loadCache() {
     const rows = db.prepare('SELECT word FROM badwords').all();
-    badWordsCache.clear();
-    rows.forEach(r => badWordsCache.add(r.word));
+    if (rows.length === 0) {
+        badWordsRegex = null;
+        return;
+    }
+    // Escapa caracteres especiais para não quebrar o filtro (ex: c* vira c\*)
+    const escaped = rows.map(r => r.word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    badWordsRegex = new RegExp(`\\b(${escaped.join('|')})\\b`, 'i');
 }
 
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds, 
-        GatewayIntentBits.GuildMessages, 
-        GatewayIntentBits.MessageContent, 
-        GatewayIntentBits.GuildMembers
-    ]
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildMembers]
 });
 
 async function sendLog(guildId, embed) {
@@ -84,60 +86,58 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'addword') {
         const word = options.getString('palavra').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
         db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)').run(word);
-        badWordsCache.add(word);
+        loadCache(); // Recarrega o filtro
         return interaction.reply({ content: `✅ Banida: **${word}**`, ephemeral: true });
     }
 
     if (commandName === 'clear') {
         const amt = Math.min(options.getInteger('qtd'), 100);
         await interaction.channel.bulkDelete(amt, true);
-        return interaction.reply({ content: `✅ ${amt} mensagens limpas.`, ephemeral: true });
+        return interaction.reply({ content: `✅ Limpo.`, ephemeral: true });
     }
 
     if (commandName === 'kick' || commandName === 'ban') {
         const user = options.getUser('alvo');
         const member = await guild.members.fetch(user.id).catch(() => null);
-        if (!member || !member.moderatable) return interaction.reply({ content: '❌ Não posso moderar este usuário.', ephemeral: true });
+        if (!member || !member.moderatable) return interaction.reply({ content: '❌ Erro de hierarquia.', ephemeral: true });
         commandName === 'kick' ? await member.kick() : await member.ban();
-        return interaction.reply({ content: `✅ Usuário punido.` });
+        return interaction.reply({ content: `✅ Punido.` });
     }
 
     if (commandName === 'resetall') {
         db.prepare('DELETE FROM infractions WHERE guildId = ?').run(guildId);
-        return interaction.reply({ content: '✅ Infrações resetadas.' });
+        return interaction.reply({ content: '✅ Resetado.' });
     }
 });
 
 client.on('messageCreate', async message => {
-    if (!message.guild || message.author.bot || message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
+    if (!message.guild || message.author.bot || !badWordsRegex) return;
+    if (message.member?.permissions.has(PermissionsBitField.Flags.Administrator)) return;
     
     const content = message.content.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-    const hasBad = Array.from(badWordsCache).some(w => {
-        const pattern = w.includes(' ') ? w : `\\b${w}\\b`;
-        return new RegExp(pattern, 'i').test(content);
-    });
-
-    if (hasBad) {
+    
+    if (badWordsRegex.test(content)) {
         await message.delete().catch(() => {});
-        if (!message.member.moderatable) return;
+        if (!message.member || !message.member.moderatable) return;
 
         const row = db.prepare('SELECT count FROM infractions WHERE guildId = ? AND userId = ?').get(message.guild.id, message.author.id);
         const count = row ? row.count + 1 : 1;
         db.prepare('INSERT INTO infractions (guildId, userId, count) VALUES (?, ?, ?) ON CONFLICT(guildId, userId) DO UPDATE SET count = excluded.count').run(message.guild.id, message.author.id, count);
 
-        const ms = Math.min(Math.pow(2, count - 1) * 60000, 2419200000);
+        const minutes = Math.pow(2, count - 1);
+        const ms = Math.min(minutes * 60000, 2419200000);
         await message.member.timeout(ms, 'Linguagem proibida').catch(() => {});
 
         const embed = new EmbedBuilder()
-            .setTitle('🔨 Moderação Automática')
+            .setTitle('🔨 Castigo Aplicado')
             .setColor(0xff0000)
             .addFields(
                 { name: 'Usuário', value: message.author.tag, inline: true },
                 { name: 'Infrações', value: `${count}`, inline: true },
-                { name: 'Tempo', value: `${Math.pow(2, count - 1)} min`, inline: true }
+                { name: 'Tempo', value: `${minutes} min`, inline: true }
             ).setTimestamp();
         sendLog(message.guild.id, embed);
     }
 });
 
-client.login(TOKEN);
+client.login(TOKEN)
