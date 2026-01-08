@@ -1,215 +1,208 @@
-require('dotenv').config();
-
-const {
-  Client,
-  GatewayIntentBits,
-  PermissionsBitField,
-  EmbedBuilder,
-  REST,
-  Routes,
-  SlashCommandBuilder
+const { 
+    Client, 
+    GatewayIntentBits, 
+    PermissionsBitField, 
+    EmbedBuilder,
+    SlashCommandBuilder,
+    REST,
+    Routes
 } = require('discord.js');
 
-const fs = require('fs');
-const db = require('./database');
+const Database = require('better-sqlite3');
+const db = new Database('sparkkmod.db');
 
-let palavroes = require('./palavroes.json').palavroes;
+// ====== CONFIG ======
+const TOKEN = process.env.DISCORD_TOKEN;
 
+// ====== CLIENT ======
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.DirectMessages
-  ],
-  partials: ['CHANNEL']
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildVoiceStates
+    ]
 });
 
-/* ================= FUNÇÕES ================= */
+// ====== DATABASE ======
+db.prepare(`
+CREATE TABLE IF NOT EXISTS settings (
+    guildId TEXT PRIMARY KEY,
+    logChannel TEXT
+)
+`).run();
 
+db.prepare(`
+CREATE TABLE IF NOT EXISTS infractions (
+    guildId TEXT,
+    userId TEXT,
+    count INTEGER,
+    PRIMARY KEY (guildId, userId)
+)
+`).run();
+
+db.prepare(`
+CREATE TABLE IF NOT EXISTS badwords (
+    word TEXT PRIMARY KEY
+)
+`).run();
+
+// ====== PALAVRÕES (EXEMPLO – você pode expandir) ======
+const defaultBadWords = ['porra', 'caralho', 'puta', 'viado', 'fdp'];
+defaultBadWords.forEach(w => {
+    db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)').run(w);
+});
+
+// ====== FUNÇÕES ======
 function normalize(text) {
-  return text
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9\s]/g, ' ');
+    return text
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '');
 }
 
-function escapeRegex(word) {
-  return word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+function containsBadWord(text) {
+    const words = db.prepare('SELECT word FROM badwords').all();
+    const content = normalize(text);
+
+    return words.some(w => {
+        const regex = new RegExp(`\\b${w.word}\\b`, 'i');
+        return regex.test(content);
+    });
 }
 
-function hasBadWord(text) {
-  const msg = normalize(text);
+async function sendLog(guildId, embed) {
+    const row = db.prepare(
+        'SELECT logChannel FROM settings WHERE guildId = ?'
+    ).get(guildId);
 
-  return palavroes.some(word => {
-    if (!word || typeof word !== 'string') return false;
+    if (!row) return;
 
-    const clean = word.trim();
-    if (!clean) return false;
-
-    const safe = escapeRegex(clean);
-
-    // palavras curtas (cu, mf, etc)
-    if (safe.length < 3) {
-      const regex = new RegExp(`(^|\\s)${safe}(\\s|$)`, 'i');
-      return regex.test(msg);
+    try {
+        const channel = await client.channels.fetch(row.logChannel);
+        if (!channel) return;
+        await channel.send({ embeds: [embed] });
+    } catch (e) {
+        console.error('Erro log:', e.message);
     }
-
-    // palavras normais
-    const regex = new RegExp(`\\b${safe}\\b`, 'i');
-    return regex.test(msg);
-  });
 }
 
-function getLogChannelId() {
-  const row = db.prepare(
-    `SELECT value FROM config WHERE key = 'log_channel'`
-  ).get();
-  return row ? row.value : null;
-}
-
-/* ================= SLASH COMMANDS ================= */
-
+// ====== SLASH COMMANDS ======
 const commands = [
-  new SlashCommandBuilder()
-    .setName('addword')
-    .setDescription('Adicionar palavra proibida')
-    .addStringOption(opt =>
-      opt.setName('palavra')
-        .setDescription('Palavra')
-        .setRequired(true)
-    ),
+    new SlashCommandBuilder()
+        .setName('setlog')
+        .setDescription('Define o canal de logs')
+        .addChannelOption(opt =>
+            opt.setName('canal')
+               .setDescription('Canal de logs')
+               .setRequired(true)
+        ),
 
-  new SlashCommandBuilder()
-    .setName('setlog')
-    .setDescription('Definir canal de logs')
-    .addChannelOption(opt =>
-      opt.setName('canal')
-        .setDescription('Canal de logs')
-        .setRequired(true)
-    ),
+    new SlashCommandBuilder()
+        .setName('addword')
+        .setDescription('Adiciona palavrão')
+        .addStringOption(opt =>
+            opt.setName('palavra')
+               .setDescription('Palavra proibida')
+               .setRequired(true)
+        ),
 
-  new SlashCommandBuilder()
-    .setName('resetinfractions')
-    .setDescription('Resetar punições de TODOS os usuários')
+    new SlashCommandBuilder()
+        .setName('resetall')
+        .setDescription('Reseta punições de todos')
 ].map(cmd => cmd.toJSON());
 
-/* ================= READY ================= */
-
 client.once('ready', async () => {
-  console.log(`🔥 SparkkMod online como ${client.user.tag}`);
+    console.log(`🔥 SparkkMod online como ${client.user.tag}`);
 
-  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-  await rest.put(
-    Routes.applicationCommands(client.user.id),
-    { body: commands }
-  );
+    const rest = new REST({ version: '10' }).setToken(TOKEN);
+    await rest.put(
+        Routes.applicationCommands(client.user.id),
+        { body: commands }
+    );
 
-  console.log('✅ Slash commands globais registrados');
+    console.log('✅ Slash commands globais registrados');
 });
 
-/* ================= INTERACTIONS ================= */
-
+// ====== INTERACTIONS ======
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
+    if (!interaction.isChatInputCommand()) return;
 
-  if (!interaction.memberPermissions?.has(PermissionsBitField.Flags.Administrator)) {
-    return interaction.reply({
-      content: '❌ Apenas administradores.',
-      flags: 64
-    });
-  }
-
-  // /addword
-  if (interaction.commandName === 'addword') {
-    const palavra = normalize(interaction.options.getString('palavra')).trim();
-
-    if (palavroes.includes(palavra)) {
-      return interaction.reply({ content: '⚠️ Palavra já existe.', flags: 64 });
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ModerateMembers)) {
+        return interaction.reply({ content: '❌ Sem permissão.', ephemeral: true });
     }
 
-    palavroes.push(palavra);
-    fs.writeFileSync('./palavroes.json', JSON.stringify({ palavroes }, null, 2));
+    if (interaction.commandName === 'setlog') {
+        const channel = interaction.options.getChannel('canal');
 
-    return interaction.reply(`✅ Palavra **${palavra}** adicionada.`);
-  }
+        db.prepare(`
+            INSERT INTO settings (guildId, logChannel)
+            VALUES (?, ?)
+            ON CONFLICT(guildId)
+            DO UPDATE SET logChannel = excluded.logChannel
+        `).run(interaction.guildId, channel.id);
 
-  // /setlog
-  if (interaction.commandName === 'setlog') {
-    const canal = interaction.options.getChannel('canal');
+        return interaction.reply({ content: `✅ Logs definidos em ${channel}`, ephemeral: true });
+    }
 
-    db.prepare(`
-      INSERT OR REPLACE INTO config (key, value)
-      VALUES ('log_channel', ?)
-    `).run(canal.id);
+    if (interaction.commandName === 'addword') {
+        const word = normalize(interaction.options.getString('palavra'));
+        db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)').run(word);
+        return interaction.reply({ content: `✅ Palavra adicionada: **${word}**`, ephemeral: true });
+    }
 
-    return interaction.reply(`📄 Canal de logs definido: ${canal}`);
-  }
-
-  // /resetinfractions
-  if (interaction.commandName === 'resetinfractions') {
-    db.prepare('DELETE FROM infractions').run();
-    return interaction.reply('🧹 Todas as punições foram resetadas.');
-  }
+    if (interaction.commandName === 'resetall') {
+        db.prepare('DELETE FROM infractions WHERE guildId = ?').run(interaction.guildId);
+        return interaction.reply({ content: '✅ Punições resetadas.', ephemeral: true });
+    }
 });
 
-/* ================= MODERAÇÃO ================= */
-
+// ====== MENSAGENS ======
 client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-  if (!message.guild) return;
-  if (message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
-  if (!hasBadWord(message.content)) return;
+    if (message.author.bot || !message.guild) return;
+    if (message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
 
-  try {
-    await message.delete();
+    if (!containsBadWord(message.content)) return;
 
-    let row = db.prepare(
-      'SELECT count FROM infractions WHERE userId = ?'
-    ).get(message.author.id);
+    await message.delete().catch(() => {});
 
-    let count = row ? row.count + 1 : 1;
-    let minutes = Math.pow(2, count - 1);
-    let ms = minutes * 60 * 1000;
+    const row = db.prepare(`
+        SELECT count FROM infractions
+        WHERE guildId = ? AND userId = ?
+    `).get(message.guild.id, message.author.id);
+
+    const count = row ? row.count + 1 : 1;
+
+    db.prepare(`
+        INSERT INTO infractions (guildId, userId, count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(guildId, userId)
+        DO UPDATE SET count = excluded.count
+    `).run(message.guild.id, message.author.id, count);
+
+    const minutes = Math.pow(2, count - 1);
+    const ms = minutes * 60 * 1000;
     const MAX = 28 * 24 * 60 * 60 * 1000;
 
     if (ms >= MAX) {
-      await message.member.kick('Limite de infrações');
+        await message.member.kick('Limite de infrações atingido');
     } else {
-      await message.member.timeout(ms, 'Palavrão detectado');
+        await message.member.timeout(ms, 'Linguagem proibida');
     }
 
-    db.prepare(
-      'INSERT OR REPLACE INTO infractions (userId, count) VALUES (?, ?)'
-    ).run(message.author.id, count);
+    const embed = new EmbedBuilder()
+        .setTitle('🔨 SparkkMod')
+        .setColor(0xff0000)
+        .addFields(
+            { name: 'Usuário', value: `${message.author.tag}` },
+            { name: 'Infrações', value: `${count}` },
+            { name: 'Punição', value: ms >= MAX ? 'Kick' : `${minutes} min` }
+        )
+        .setTimestamp();
 
-    // ===== LOG =====
-    const logId = getLogChannelId();
-    if (logId) {
-      const logChannel = await message.guild.channels.fetch(logId).catch(() => null);
-
-      if (logChannel) {
-        const embed = new EmbedBuilder()
-          .setTitle('🚨 SparkkMod - Moderação')
-          .setColor('Red')
-          .addFields(
-            { name: 'Usuário', value: message.author.tag, inline: true },
-            { name: 'Infrações', value: `${count}`, inline: true },
-            { name: 'Punição', value: ms >= MAX ? 'Kick' : `${minutes} min mute` }
-          )
-          .setTimestamp();
-
-        await logChannel.send({ embeds: [embed] });
-      }
-    }
-
-  } catch (err) {
-    console.error('Erro SparkkMod:', err.message);
-  }
+    sendLog(message.guild.id, embed);
 });
 
-/* ================= LOGIN ================= */
-
-client.login(process.env.DISCORD_TOKEN);
+// ====== LOGIN ======
+client.login(TOKEN);
