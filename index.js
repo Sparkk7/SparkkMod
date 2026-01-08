@@ -1,7 +1,7 @@
-const { 
-    Client, 
-    GatewayIntentBits, 
-    PermissionsBitField, 
+const {
+    Client,
+    GatewayIntentBits,
+    PermissionsBitField,
     EmbedBuilder,
     SlashCommandBuilder,
     REST,
@@ -9,10 +9,13 @@ const {
 } = require('discord.js');
 
 const Database = require('better-sqlite3');
-const db = new Database('sparkkmod.db');
 
-// ====== CONFIG ======
+// ====== ENV ======
 const TOKEN = process.env.DISCORD_TOKEN;
+if (!TOKEN) {
+    console.error("❌ DISCORD_TOKEN não definido");
+    process.exit(1);
+}
 
 // ====== CLIENT ======
 const client = new Client({
@@ -20,41 +23,42 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildVoiceStates
+        GatewayIntentBits.GuildMembers
     ]
 });
 
 // ====== DATABASE ======
-db.prepare(`
-CREATE TABLE IF NOT EXISTS settings (
+const db = new Database('sparkkmod.db');
+
+// recria tabelas corretamente (idempotente)
+db.exec(`
+DROP TABLE IF EXISTS settings;
+DROP TABLE IF EXISTS infractions;
+DROP TABLE IF EXISTS badwords;
+
+CREATE TABLE settings (
     guildId TEXT PRIMARY KEY,
     logChannel TEXT
-)
-`).run();
+);
 
-db.prepare(`
-CREATE TABLE IF NOT EXISTS infractions (
+CREATE TABLE infractions (
     guildId TEXT,
     userId TEXT,
     count INTEGER,
     PRIMARY KEY (guildId, userId)
-)
-`).run();
+);
 
-db.prepare(`
-CREATE TABLE IF NOT EXISTS badwords (
+CREATE TABLE badwords (
     word TEXT PRIMARY KEY
-)
-`).run();
+);
+`);
 
-// ====== PALAVRÕES (EXEMPLO – você pode expandir) ======
-const defaultBadWords = ['porra', 'caralho', 'puta', 'viado', 'fdp'];
-defaultBadWords.forEach(w => {
-    db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)').run(w);
-});
+// palavras iniciais seguras
+['porra', 'caralho', 'puta', 'fdp', 'viado'].forEach(w =>
+    db.prepare('INSERT OR IGNORE INTO badwords (word) VALUES (?)').run(w)
+);
 
-// ====== FUNÇÕES ======
+// ====== HELPERS ======
 function normalize(text) {
     return text
         .toLowerCase()
@@ -62,12 +66,12 @@ function normalize(text) {
         .replace(/[\u0300-\u036f]/g, '');
 }
 
-function containsBadWord(text) {
-    const words = db.prepare('SELECT word FROM badwords').all();
+function hasBadWord(text) {
     const content = normalize(text);
+    const words = db.prepare('SELECT word FROM badwords').all();
 
-    return words.some(w => {
-        const regex = new RegExp(`\\b${w.word}\\b`, 'i');
+    return words.some(({ word }) => {
+        const regex = new RegExp(`\\b${word}\\b`, 'i');
         return regex.test(content);
     });
 }
@@ -77,12 +81,11 @@ async function sendLog(guildId, embed) {
         'SELECT logChannel FROM settings WHERE guildId = ?'
     ).get(guildId);
 
-    if (!row) return;
+    if (!row?.logChannel) return;
 
     try {
         const channel = await client.channels.fetch(row.logChannel);
-        if (!channel) return;
-        await channel.send({ embeds: [embed] });
+        if (channel) await channel.send({ embeds: [embed] });
     } catch (e) {
         console.error('Erro log:', e.message);
     }
@@ -93,26 +96,27 @@ const commands = [
     new SlashCommandBuilder()
         .setName('setlog')
         .setDescription('Define o canal de logs')
-        .addChannelOption(opt =>
-            opt.setName('canal')
-               .setDescription('Canal de logs')
-               .setRequired(true)
+        .addChannelOption(o =>
+            o.setName('canal')
+             .setDescription('Canal')
+             .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName('addword')
-        .setDescription('Adiciona palavrão')
-        .addStringOption(opt =>
-            opt.setName('palavra')
-               .setDescription('Palavra proibida')
-               .setRequired(true)
+        .setDescription('Adiciona palavra proibida')
+        .addStringOption(o =>
+            o.setName('palavra')
+             .setDescription('Palavra')
+             .setRequired(true)
         ),
 
     new SlashCommandBuilder()
         .setName('resetall')
-        .setDescription('Reseta punições de todos')
-].map(cmd => cmd.toJSON());
+        .setDescription('Reseta punições do servidor')
+].map(c => c.toJSON());
 
+// ====== READY ======
 client.once('ready', async () => {
     console.log(`🔥 SparkkMod online como ${client.user.tag}`);
 
@@ -153,17 +157,18 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (interaction.commandName === 'resetall') {
-        db.prepare('DELETE FROM infractions WHERE guildId = ?').run(interaction.guildId);
+        db.prepare('DELETE FROM infractions WHERE guildId = ?')
+          .run(interaction.guildId);
         return interaction.reply({ content: '✅ Punições resetadas.', ephemeral: true });
     }
 });
 
-// ====== MENSAGENS ======
+// ====== MESSAGE MODERATION ======
 client.on('messageCreate', async message => {
-    if (message.author.bot || !message.guild) return;
+    if (!message.guild || message.author.bot) return;
     if (message.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
 
-    if (!containsBadWord(message.content)) return;
+    if (!hasBadWord(message.content)) return;
 
     await message.delete().catch(() => {});
 
@@ -195,7 +200,7 @@ client.on('messageCreate', async message => {
         .setTitle('🔨 SparkkMod')
         .setColor(0xff0000)
         .addFields(
-            { name: 'Usuário', value: `${message.author.tag}` },
+            { name: 'Usuário', value: message.author.tag },
             { name: 'Infrações', value: `${count}` },
             { name: 'Punição', value: ms >= MAX ? 'Kick' : `${minutes} min` }
         )
